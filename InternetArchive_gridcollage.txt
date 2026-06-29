@@ -1,0 +1,232 @@
+# ============================================================
+#  Collage Wall — random video from archive.org list
+#  Each iteration: 12 random clips hstacked into a strip
+#  All strips vstacked into final collage
+# ============================================================
+
+$OutputFolder  = "C:\path\to\your\output_folder"
+$ClipDuration  = 10
+$ClipsPerStrip = 12
+$Iterations    = 5
+$ClipW         = 320
+$ClipH         = 240
+
+if (-not (Test-Path -LiteralPath $OutputFolder)) {
+    New-Item -ItemType Directory -Path $OutputFolder | Out-Null
+}
+
+# ============================================================
+#  STEP 1 — Pick a random video from archive.org list
+# ============================================================
+Write-Host "`n🌐 Fetching list from archive.org..."
+
+$listUrl  = "https://archive.org/services/users/@haniarym/lists/1"
+$listData = Invoke-RestMethod -Uri $listUrl -UseBasicParsing
+$allItems = $listData.value.members
+
+if (-not $allItems -or $allItems.Count -eq 0) {
+    Write-Error "❌ No items found in list."; exit 1
+}
+
+Write-Host "✅ Found $($allItems.Count) items in list."
+
+# Shuffle and try items until we find one with an MP4
+$shuffledItems = $allItems | Get-Random -Count $allItems.Count
+$InputUrl      = $null
+$chosenTitle   = $null
+
+foreach ($item in $shuffledItems) {
+    $id = $item.identifier
+    Write-Host "  Checking: $id"
+
+    try {
+        $meta    = Invoke-RestMethod -Uri "https://archive.org/metadata/$id" -UseBasicParsing
+        $mp4File = $meta.files |
+                   Where-Object { $_.name -match '\.mp4$' } |
+                   Sort-Object { if ($_.source -eq 'original') { 0 } else { 1 } } |
+                   Select-Object -First 1
+
+        if ($mp4File) {
+            $InputUrl    = "https://archive.org/download/$id/$([Uri]::EscapeUriString($mp4File.name))"
+            $chosenTitle = if ($meta.metadata.title) { $meta.metadata.title } else { $id }
+            Write-Host "  ✅ Found MP4: $chosenTitle" -ForegroundColor Green
+            break
+        }
+    } catch {
+        Write-Warning "  ⚠ Could not fetch metadata for $id"
+    }
+}
+
+if (-not $InputUrl) {
+    Write-Error "❌ Could not find any usable MP4 in the list."; exit 1
+}
+
+Write-Host "`n🎬 Selected: $chosenTitle"
+Write-Host "   URL: $InputUrl"
+
+# ============================================================
+#  STEP 2 — Get duration via ffprobe directly from URL
+# ============================================================
+Write-Host "`n📏 Reading duration..."
+$rawDuration = & ffprobe -v error -show_entries format=duration `
+                         -of default=noprint_wrappers=1:nokey=1 `
+                         $InputUrl 2>&1
+$totalDuration = 0
+[double]::TryParse(($rawDuration | Out-String).Trim(), [ref]$totalDuration) | Out-Null
+Write-Host "✅ Duration: $([math]::Round($totalDuration,1))s"
+
+if ($totalDuration -lt ($ClipsPerStrip * $ClipDuration)) {
+    Write-Error "❌ Video too short ($([math]::Round($totalDuration,1))s) for $ClipsPerStrip non-overlapping clips."; exit 1
+}
+
+$stripFiles = @()
+
+# ============================================================
+#  STEP 3 — Loop: build one horizontal strip per iteration
+# ============================================================
+for ($run = 1; $run -le $Iterations; $run++) {
+
+    Write-Host "`n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    Write-Host "  RUN $run / $Iterations"
+    Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    $TempFolder = "$OutputFolder\_temp_run$run"
+    if (-not (Test-Path -LiteralPath $TempFolder)) {
+        New-Item -ItemType Directory -Path $TempFolder | Out-Null
+    }
+
+    # --- Pick non-overlapping random start times ------------
+    $zoneSize   = ($totalDuration - $ClipDuration) / $ClipsPerStrip
+    $startTimes = @()
+
+    for ($i = 0; $i -lt $ClipsPerStrip; $i++) {
+        $zoneStart  = $i * $zoneSize
+        $zoneEnd    = $zoneStart + $zoneSize - $ClipDuration
+        if ($zoneEnd -le $zoneStart) { $zoneEnd = $zoneStart }
+        $maxRandMs  = [int](($zoneEnd - $zoneStart) * 1000)
+        $randOffset = if ($maxRandMs -gt 0) { (Get-Random -Minimum 0 -Maximum $maxRandMs) / 1000.0 } else { 0 }
+        $startTimes += [math]::Round($zoneStart + $randOffset, 3)
+    }
+
+    Write-Host "`n🎲 Start times: $($startTimes -join 's, ')s"
+
+    # --- Extract clips directly from URL --------------------
+    Write-Host "`n✂️  Extracting clips..."
+    $clipPaths = @()
+
+    for ($i = 0; $i -lt $ClipsPerStrip; $i++) {
+        $start    = $startTimes[$i]
+        $clipPath = "$TempFolder\clip_$('{0:D2}' -f ($i+1)).mp4"
+
+        Write-Host "  [$($i+1)/$ClipsPerStrip] ${start}s"
+
+        & ffmpeg -ss $start -i $InputUrl -t $ClipDuration `
+                 -vf "scale=${ClipW}:${ClipH}:force_original_aspect_ratio=decrease,pad=${ClipW}:${ClipH}:(ow-iw)/2:(oh-ih)/2,setsar=1" `
+                 -c:v libx264 -crf 23 -c:a aac `
+                 -y $clipPath 2>&1 | Out-Null
+
+        if (Test-Path -LiteralPath $clipPath) {
+            $clipPaths += $clipPath
+            Write-Host "    ✅ saved"
+        } else {
+            Write-Warning "    ⚠ Failed on clip $($i+1)"
+        }
+    }
+
+    if ($clipPaths.Count -lt 2) {
+        Write-Warning "  ⚠ Not enough clips for run $run — skipping."
+        Remove-Item -Recurse -Force $TempFolder
+        continue
+    }
+
+    # --- hstack clips into one horizontal strip -------------
+    Write-Host "`n🎞️  Stacking clips horizontally..."
+    $stripFile = "$OutputFolder\strip_run$('{0:D2}' -f $run).mp4"
+
+    $ffmpegArgs = @()
+    foreach ($clip in $clipPaths) {
+        $ffmpegArgs += "-i"; $ffmpegArgs += $clip
+    }
+
+    $n            = $clipPaths.Count
+    $scaleFilters = ""
+    $labelList    = ""
+    for ($i = 0; $i -lt $n; $i++) {
+        $scaleFilters += "[$i" + ":v]scale=${ClipW}:${ClipH}:force_original_aspect_ratio=decrease,pad=${ClipW}:${ClipH}:(ow-iw)/2:(oh-ih)/2,setsar=1[v$i];"
+        $labelList    += "[v$i]"
+    }
+    $filterStr = $scaleFilters + $labelList + "hstack=inputs=$n[out]"
+
+    $ffmpegArgs += "-filter_complex"; $ffmpegArgs += $filterStr
+    $ffmpegArgs += "-map";            $ffmpegArgs += "[out]"
+    $ffmpegArgs += "-c:v";            $ffmpegArgs += "libx264"
+    $ffmpegArgs += "-crf";            $ffmpegArgs += "23"
+    $ffmpegArgs += "-y";              $ffmpegArgs += $stripFile
+
+    & ffmpeg @ffmpegArgs
+
+    Remove-Item -Recurse -Force $TempFolder
+
+    if (Test-Path -LiteralPath $stripFile) {
+        Write-Host "  ✅ Strip $run saved." -ForegroundColor Green
+        $stripFiles += $stripFile
+    } else {
+        Write-Host "  ❌ Strip $run failed." -ForegroundColor Red
+    }
+}
+
+# ============================================================
+#  STEP 4 — vstack all strips into final collage
+# ============================================================
+Write-Host "`n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+Write-Host "  COMBINING $($stripFiles.Count) STRIPS"
+Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+$stripFiles = Get-ChildItem -Path $OutputFolder -Filter "strip_run*.mp4" |
+              Sort-Object Name |
+              Select-Object -ExpandProperty FullName
+
+Write-Host "Strips found: $($stripFiles.Count)"
+$stripFiles | ForEach-Object { Write-Host "  $_" }
+
+if ($stripFiles.Count -lt 2) {
+    Write-Error "❌ Not enough strips to combine."; exit 1
+}
+
+$safeTitle   = $chosenTitle -replace '[\\/:*?"<>|]', '_'
+$safeTitle   = $safeTitle.Substring(0, [Math]::Min(40, $safeTitle.Length)).Trim()
+$finalOutput = "$OutputFolder\collage_${safeTitle}_$(Get-Date -Format 'yyyyMMdd_HHmmss').mp4"
+
+$n      = $stripFiles.Count
+$stripW = $ClipsPerStrip * $ClipW   # full width of one horizontal strip
+$stripH = $ClipH                    # height of one strip
+
+$ffmpegArgs = @()
+foreach ($strip in $stripFiles) {
+    $ffmpegArgs += "-i"; $ffmpegArgs += $strip
+}
+
+$scaleFilters = ""
+$labelList    = ""
+for ($i = 0; $i -lt $n; $i++) {
+    $scaleFilters += "[$i" + ":v]scale=${stripW}:${stripH}:force_original_aspect_ratio=decrease,pad=${stripW}:${stripH}:(ow-iw)/2:(oh-ih)/2,setsar=1[v$i];"
+    $labelList    += "[v$i]"
+}
+$filterStr = $scaleFilters + $labelList + "vstack=inputs=$n[out]"
+
+$ffmpegArgs += "-filter_complex"; $ffmpegArgs += $filterStr
+$ffmpegArgs += "-map";            $ffmpegArgs += "[out]"
+$ffmpegArgs += "-c:v";            $ffmpegArgs += "libx264"
+$ffmpegArgs += "-crf";            $ffmpegArgs += "23"
+$ffmpegArgs += "-y";              $ffmpegArgs += $finalOutput
+
+Write-Host "`nFilter: $filterStr`n"
+& ffmpeg @ffmpegArgs
+
+if (Test-Path -LiteralPath $finalOutput) {
+    Write-Host "`n✅ Final collage saved: $finalOutput" -ForegroundColor Cyan
+    Write-Host "   Video: $chosenTitle"
+    Write-Host "   Size:  $stripW x $($n * $stripH) px  |  Duration: ~${ClipDuration}s"
+} else {
+    Write-Host "`n❌ Failed to create final collage." -ForegroundColor Red
+}
