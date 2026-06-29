@@ -39,8 +39,8 @@ from PIL import Image, ImageFilter
 #    e.g.  output_folder/photo_filtered_001.jpg
 #          output_folder/photo_filtered_002.jpg  (next run, same input)
 # ------------------------------------------------------------------------------
-DEFAULT_INPUT       = r"C:\Users\rymki\OneDrive\Documents\GRADUATION 2026\3D visual language project\experiments\ffmpgeg_selection\frame extraction\Prostokąt Dynamiczny (The Dynamic Rectangle)_20260503_151158_frame_at_10sec.png"  # ← change this
-DEFAULT_OUTPUT_DIR  = r"C:\Users\rymki\OneDrive\Documents\GRADUATION 2026\3D visual language project\experiments\ffmpgeg_selection\frame extraction\ffmpeg_edited\image filters"     # ← change this
+DEFAULT_INPUT       = r"C:\path\to\input.png"  # ← change this
+DEFAULT_OUTPUT_DIR  = r"C:\path\to\output_folder"     # ← change this
 
 # ------------------------------------------------------------------------------
 #  COLOR MODE
