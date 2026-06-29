@@ -1,0 +1,256 @@
+# ============================================================
+#  Extract 12 random masked boxes from a collage video
+#  Boxes do NOT overlap — placed randomly across canvas
+#  Combined at 0.7 opacity, with spatially mapped audio
+# ============================================================
+
+$InputFile    = "C:\path\to\your\input.mp4"
+$OutputFolder = "C:\path\to\yor\output"
+$BoxW         = 320
+$BoxW         = 320
+$BoxH         = 240
+$CanvasW      = 3840
+$CanvasH      = 1200
+$BoxCount     = 12
+$Opacity      = 0.7
+$VideoDuration = 10.0
+
+if (-not (Test-Path -LiteralPath $InputFile)) {
+    Write-Error "❌ File not found: $InputFile"; exit 1
+}
+if (-not (Test-Path -LiteralPath $OutputFolder)) {
+    New-Item -ItemType Directory -Path $OutputFolder | Out-Null
+}
+
+# ============================================================
+#  HELPER — Returns $true if candidate box doesn't touch any placed box
+# ============================================================
+function Is-NoOverlap {
+    param($cx, $cy, $existingBoxes, $bw, $bh)
+    foreach ($b in $existingBoxes) {
+        $overlapX = ($cx -lt ($b.X + $bw)) -and (($cx + $bw) -gt $b.X)
+        $overlapY = ($cy -lt ($b.Y + $bh)) -and (($cy + $bh) -gt $b.Y)
+        if ($overlapX -and $overlapY) { return $false }
+    }
+    return $true
+}
+
+# ============================================================
+#  STEP 1 — Place boxes randomly with no overlap
+# ============================================================
+Write-Host "`n📦 Placing $BoxCount boxes (no overlap, random)..."
+$boxes       = @()
+$maxAttempts = 10000
+
+for ($i = 0; $i -lt $BoxCount; $i++) {
+    $placed   = $false
+    $attempts = 0
+
+    while (-not $placed -and $attempts -lt $maxAttempts) {
+        $attempts++
+        $x = Get-Random -Minimum 0 -Maximum ($CanvasW - $BoxW)
+        $y = Get-Random -Minimum 0 -Maximum ($CanvasH - $BoxH)
+
+        if (Is-NoOverlap $x $y $boxes $BoxW $BoxH) {
+            $boxes += [PSCustomObject]@{ X = $x; Y = $y }
+            $placed = $true
+            Write-Host "  Box $($i+1): x=$x y=$y  (attempt $attempts)"
+        }
+    }
+
+    if (-not $placed) {
+        Write-Warning "  ⚠ Could not place box $($i+1) without overlap after $maxAttempts attempts — forcing"
+        $x = Get-Random -Minimum 0 -Maximum ($CanvasW - $BoxW)
+        $y = Get-Random -Minimum 0 -Maximum ($CanvasH - $BoxH)
+        $boxes += [PSCustomObject]@{ X = $x; Y = $y }
+        Write-Host "  Box $($i+1): x=$x y=$y  (forced)"
+    }
+}
+
+# ============================================================
+#  STEP 2 — Extract each video box, pad back to canvas
+# ============================================================
+Write-Host "`n✂️  Extracting masked video boxes..."
+$boxPaths = @()
+
+for ($i = 0; $i -lt $BoxCount; $i++) {
+    $x       = $boxes[$i].X
+    $y       = $boxes[$i].Y
+    $outPath = "$OutputFolder\box_$('{0:D2}' -f ($i+1))_x${x}_y${y}.mp4"
+
+    Write-Host "  [$($i+1)/$BoxCount] crop x=$x y=$y"
+
+    $vf = "crop=${BoxW}:${BoxH}:${x}:${y},pad=${CanvasW}:${CanvasH}:${x}:${y}:black"
+
+    & ffmpeg -i $InputFile `
+             -vf $vf `
+             -an `
+             -c:v libx264 -crf 23 `
+             -y $outPath 2>&1 | Out-Null
+
+    if (Test-Path -LiteralPath $outPath) {
+        $boxPaths += $outPath
+        Write-Host "    ✅ saved"
+    } else {
+        Write-Warning "    ⚠ Failed on box $($i+1)"
+    }
+}
+
+# ============================================================
+#  STEP 3 — Extract full audio from input file
+# ============================================================
+Write-Host "`n🔊 Extracting full audio from input..."
+$fullAudio = "$OutputFolder\_full_audio.wav"
+
+& ffmpeg -i $InputFile `
+         -vn -c:a pcm_s16le -ac 2 -ar 44100 `
+         -y $fullAudio 2>&1 | Out-Null
+
+if (-not (Test-Path -LiteralPath $fullAudio)) {
+    Write-Error "❌ Failed to extract audio from input file."; exit 1
+}
+Write-Host "  ✅ Full audio extracted"
+
+# ============================================================
+#  STEP 4 — Extract one audio snippet per box, spatially mapped
+#  Box X position maps to time: start = (X / CanvasW) * Duration
+#  Box width maps to duration:  dur   = (BoxW / CanvasW) * Duration
+# ============================================================
+Write-Host "`n🎚️  Extracting spatially mapped audio snippets..."
+$snippetPaths = @()
+$delaysMs     = @()
+
+for ($i = 0; $i -lt $BoxCount; $i++) {
+    $x = $boxes[$i].X
+
+    $audioStart    = [math]::Round(($x / $CanvasW) * $VideoDuration, 4)
+    $audioDuration = [math]::Round(($BoxW / $CanvasW) * $VideoDuration, 4)
+    $delayMs       = [int]($audioStart * 1000)
+
+    $snippetPath = "$OutputFolder\_snippet_$('{0:D2}' -f ($i+1)).wav"
+
+    Write-Host "  Box $($i+1): x=$x → audio ${audioStart}s for ${audioDuration}s (delay ${delayMs}ms)"
+
+    & ffmpeg -ss $audioStart -i $fullAudio -t $audioDuration `
+             -c:a pcm_s16le -ac 2 -ar 44100 `
+             -y $snippetPath 2>&1 | Out-Null
+
+    if (Test-Path -LiteralPath $snippetPath) {
+        $snippetPaths += $snippetPath
+        $delaysMs     += $delayMs
+        Write-Host "    ✅ saved"
+    } else {
+        Write-Warning "    ⚠ Failed on snippet $($i+1)"
+    }
+}
+
+# ============================================================
+#  STEP 5 — Build spatially mapped audio track
+# ============================================================
+Write-Host "`n🎛️  Compositing audio with spatial delays..."
+$audioOutput = "$OutputFolder\_spatial_audio.wav"
+
+$ffmpegArgs = @()
+foreach ($snippet in $snippetPaths) {
+    $ffmpegArgs += "-i"; $ffmpegArgs += $snippet
+}
+
+$n      = $snippetPaths.Count
+$filter = ""
+
+for ($i = 0; $i -lt $n; $i++) {
+    $d = $delaysMs[$i]
+    $filter += "[$($i):a]adelay=${d}|${d}[d$($i)];"
+}
+
+$mixLabels = ""
+for ($i = 0; $i -lt $n; $i++) { $mixLabels += "[d$($i)]" }
+$filter += "${mixLabels}amix=inputs=${n}:duration=longest:normalize=0[aout]"
+
+$ffmpegArgs += "-filter_complex"; $ffmpegArgs += $filter
+$ffmpegArgs += "-map";            $ffmpegArgs += "[aout]"
+$ffmpegArgs += "-c:a";            $ffmpegArgs += "pcm_s16le"
+$ffmpegArgs += "-ac";             $ffmpegArgs += "2"
+$ffmpegArgs += "-y";              $ffmpegArgs += $audioOutput
+
+& ffmpeg @ffmpegArgs
+
+if (-not (Test-Path -LiteralPath $audioOutput)) {
+    Write-Error "❌ Failed to build spatial audio."; exit 1
+}
+Write-Host "  ✅ Spatial audio built"
+
+# ============================================================
+#  STEP 6 — Composite all video boxes
+# ============================================================
+Write-Host "`n🎞️  Compositing $($boxPaths.Count) video boxes at $([int]($Opacity*100))% opacity..."
+
+$inputName   = [System.IO.Path]::GetFileNameWithoutExtension($InputFile)
+$finalOutput = "$OutputFolder\boxes_${inputName}_$(Get-Date -Format 'yyyyMMdd_HHmmss').mp4"
+
+$ffmpegArgs = @()
+foreach ($box in $boxPaths) {
+    $ffmpegArgs += "-i"; $ffmpegArgs += $box
+}
+$ffmpegArgs += "-i"; $ffmpegArgs += $audioOutput
+
+$n      = $boxPaths.Count
+$filter = ""
+
+for ($i = 0; $i -lt $n; $i++) {
+    $filter += "[$($i):v]colorchannelmixer=rr=${Opacity}:gg=${Opacity}:bb=${Opacity}[f$($i)];"
+}
+
+if ($n -eq 1) {
+    $filter += "[f0]null[vout]"
+} elseif ($n -eq 2) {
+    $filter += "[f0][f1]blend=all_mode=addition[vout]"
+} else {
+    $filter += "[f0][f1]blend=all_mode=addition[tmp1];"
+    for ($i = 2; $i -lt $n; $i++) {
+        $prev = $i - 1
+        if ($i -eq $n - 1) {
+            $filter += "[tmp$prev][f$($i)]blend=all_mode=addition[vout]"
+        } else {
+            $filter += "[tmp$prev][f$($i)]blend=all_mode=addition[tmp$($i)];"
+        }
+    }
+}
+
+$ffmpegArgs += "-filter_complex"; $ffmpegArgs += $filter
+$ffmpegArgs += "-map";            $ffmpegArgs += "[vout]"
+$ffmpegArgs += "-map";            $ffmpegArgs += "$($n):a"
+$ffmpegArgs += "-c:v";            $ffmpegArgs += "libx264"
+$ffmpegArgs += "-crf";            $ffmpegArgs += "23"
+$ffmpegArgs += "-pix_fmt";        $ffmpegArgs += "yuv420p"
+$ffmpegArgs += "-c:a";            $ffmpegArgs += "aac"
+$ffmpegArgs += "-ac";             $ffmpegArgs += "2"
+$ffmpegArgs += "-shortest"
+$ffmpegArgs += "-y";              $ffmpegArgs += $finalOutput
+
+& ffmpeg @ffmpegArgs
+
+# ============================================================
+#  STEP 7 — Cleanup temp files
+# ============================================================
+Write-Host "`n🧹 Cleaning up temp files..."
+$boxPaths     | Remove-Item -Force -ErrorAction SilentlyContinue
+$snippetPaths | Remove-Item -Force -ErrorAction SilentlyContinue
+Remove-Item -Force -ErrorAction SilentlyContinue $fullAudio
+Remove-Item -Force -ErrorAction SilentlyContinue $audioOutput
+
+if (Test-Path -LiteralPath $finalOutput) {
+    Write-Host "`n✅ Saved: $finalOutput" -ForegroundColor Cyan
+    Write-Host "   Canvas:  ${CanvasW}x${CanvasH}"
+    Write-Host "   Boxes:   $BoxCount x ${BoxW}x${BoxH}"
+    Write-Host "   Opacity: $([int]($Opacity*100))%"
+    Write-Host "`n   Spatial audio mapping (x → time):"
+    for ($i = 0; $i -lt $boxes.Count; $i++) {
+        $x   = $boxes[$i].X
+        $t   = [math]::Round(($x / $CanvasW) * $VideoDuration, 2)
+        $dur = [math]::Round(($BoxW / $CanvasW) * $VideoDuration, 2)
+        Write-Host "   Box $($i+1): x=$x → ${t}s for ${dur}s"
+    }
+} else {
+    Write-Host "`n❌ Failed to create output." -ForegroundColor Red
+}
