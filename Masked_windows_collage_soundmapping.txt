@@ -1,0 +1,303 @@
+# =============================================================================
+# collage_boxes_local.ps1
+#
+# PIPELINE:
+#   1. Use a local video file
+#   2. Place 20 random non-overlapping boxes on the video
+#   3. Mask: only boxes visible, everything else black
+#   4. Audio: slice video audio using box X positions as timeline markers
+#             gaps = quiet, boxes = louder, stacked boxes = additive volume
+#   5. Output: MP4 (masked video + audio) + WAV (audio only)
+#
+# Usage:
+#   .\collage_boxes_local.ps1
+#
+# First time only:
+#   Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+# =============================================================================
+
+# ─── INPUT & OUTPUT ───────────────────────────────────────────────────────────
+$InputFile    = "C:\your\input.mp4"
+$OutputFolder = "C:\your\output\folder"
+
+# ─── CONFIGURATION ────────────────────────────────────────────────────────────
+$BoxCount    = 20      # number of visible boxes
+$MaxAttempts = 10000   # placement attempts per box before forcing
+$BoxW        = 320     # box width  (px)
+$BoxH        = 240     # box height (px)
+
+# ─── VOLUME CONFIGURATION ─────────────────────────────────────────────────────
+# SliceVolume  : base volume per box slice — stacks additively when boxes share X
+#                  1 box  = SliceVolume
+#                  2 boxes at same X = SliceVolume * 2  (louder)
+#                  3 boxes at same X = SliceVolume * 3  (louder still)
+# GapVolume    : volume under black regions (almost silent but audible)
+# FadeDuration : seconds to ease in/out at start and end of each box slice
+$SliceVolume  = 0.25
+$GapVolume    = 0.2
+$FadeDuration = 0.5
+
+# ─── SETUP ────────────────────────────────────────────────────────────────────
+if (-not (Test-Path -LiteralPath $InputFile)) {
+    Write-Error "ERROR: Input file not found: $InputFile"; exit 1
+}
+if (-not (Test-Path $OutputFolder)) {
+    New-Item -ItemType Directory -Path $OutputFolder | Out-Null
+}
+
+$TempFolder = Join-Path $OutputFolder "_temp"
+if (Test-Path $TempFolder) { Remove-Item $TempFolder -Recurse -Force }
+New-Item -ItemType Directory -Path $TempFolder | Out-Null
+
+$Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$LogFile   = Join-Path $OutputFolder "run_${Timestamp}.log"
+
+function Log($msg) {
+    $line = "[{0}] {1}" -f (Get-Date -Format "HH:mm:ss"), $msg
+    Write-Host $line
+    Add-Content -Path $LogFile -Value $line
+}
+
+foreach ($tool in @("ffmpeg","ffprobe")) {
+    if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+        Write-Error "ERROR: $tool not found. Install ffmpeg and add to PATH."; exit 1
+    }
+}
+
+function Is-NoOverlap($cx, $cy, $placed) {
+    foreach ($b in $placed) {
+        if (($cx -lt ($b.X+$BoxW)) -and (($cx+$BoxW) -gt $b.X) -and
+            ($cy -lt ($b.Y+$BoxH)) -and (($cy+$BoxH) -gt $b.Y)) { return $false }
+    }
+    return $true
+}
+
+$Title     = [System.IO.Path]::GetFileNameWithoutExtension($InputFile) -replace '[\\/:*?"<>|]','_'
+$Title     = $Title.Substring(0, [Math]::Min(50, $Title.Length)).Trim()
+$LocalFile = $InputFile
+
+Log "=== collage_boxes_local ==="
+Log "Input : $InputFile"
+
+# ─── GET VIDEO PROPERTIES ─────────────────────────────────────────────────────
+$DurRaw  = & ffprobe -v error -show_entries format=duration `
+               -of default=noprint_wrappers=1:nokey=1 $LocalFile 2>>$LogFile
+$Duration = [double]($DurRaw | Out-String).Trim()
+
+# Get actual video width and height
+$WidthRaw  = & ffprobe -v error -select_streams v:0 -show_entries stream=width `
+                 -of default=noprint_wrappers=1:nokey=1 $LocalFile 2>>$LogFile
+$HeightRaw = & ffprobe -v error -select_streams v:0 -show_entries stream=height `
+                 -of default=noprint_wrappers=1:nokey=1 $LocalFile 2>>$LogFile
+$fpsRaw    = & ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate `
+                 -of default=noprint_wrappers=1:nokey=1 $LocalFile 2>>$LogFile
+
+$CanvasW = [int]($WidthRaw  | Out-String).Trim()
+$CanvasH = [int]($HeightRaw | Out-String).Trim()
+$fps     = ($fpsRaw | Out-String).Trim()
+
+Log "Duration : $([math]::Round($Duration,1))s"
+Log "Canvas   : ${CanvasW} x ${CanvasH} px @ ${fps}fps"
+
+if ($Duration -lt 1) { Log "ERROR: could not read video duration"; exit 1 }
+if ($CanvasW  -lt 1) { Log "ERROR: could not read video width";    exit 1 }
+
+# =============================================================================
+#  STEP 1 — PLACE BOXES
+# =============================================================================
+Log ""
+Log "--- STEP 1: Placing $BoxCount boxes ---"
+
+$Boxes = @()
+for ($i = 0; $i -lt $BoxCount; $i++) {
+    $placed = $false; $attempts = 0
+    while (-not $placed -and $attempts -lt $MaxAttempts) {
+        $attempts++
+        $x = Get-Random -Minimum 0 -Maximum ([math]::Max(1, $CanvasW - $BoxW))
+        $y = Get-Random -Minimum 0 -Maximum ([math]::Max(1, $CanvasH - $BoxH))
+        if (Is-NoOverlap $x $y $Boxes) {
+            $Boxes += [PSCustomObject]@{ X=$x; Y=$y }
+            $placed = $true
+            Log "  Box $($i+1): x=$x y=$y"
+        }
+    }
+    if (-not $placed) {
+        $x = Get-Random -Minimum 0 -Maximum ([math]::Max(1, $CanvasW - $BoxW))
+        $y = Get-Random -Minimum 0 -Maximum ([math]::Max(1, $CanvasH - $BoxH))
+        $Boxes += [PSCustomObject]@{ X=$x; Y=$y }
+        Log "  Box $($i+1): x=$x y=$y (forced)"
+    }
+}
+
+# =============================================================================
+#  STEP 2 — BOX MASKING
+#  Black base + overlay each box region from the original video
+# =============================================================================
+Log ""
+Log "--- STEP 2: Masking ---"
+
+$MaskedVideo = Join-Path $TempFolder "masked.mp4"
+$ffArgs      = @("-i"; $LocalFile)
+$fParts      = @()
+
+# Black base matching video size and duration
+$fParts += "color=black:size=${CanvasW}x${CanvasH}:rate=${fps}:duration=${Duration}[base]"
+
+# Crop each box from the input video
+for ($i = 0; $i -lt $Boxes.Count; $i++) {
+    $x = $Boxes[$i].X; $y = $Boxes[$i].Y
+    $fParts += "[0:v]crop=${BoxW}:${BoxH}:${x}:${y}[box$i]"
+}
+
+# Chain overlays onto black base
+$prev = "base"
+for ($i = 0; $i -lt $Boxes.Count; $i++) {
+    $x    = $Boxes[$i].X; $y = $Boxes[$i].Y
+    $next = if ($i -eq $Boxes.Count-1) { "vout" } else { "tmp$i" }
+    $fParts += "[${prev}][box$i]overlay=${x}:${y}[${next}]"
+    $prev   = "tmp$i"
+}
+
+$filterStr = $fParts -join ";"
+$ffArgs += "-filter_complex"; $ffArgs += $filterStr
+$ffArgs += "-map";     $ffArgs += "[vout]"
+$ffArgs += "-c:v";     $ffArgs += "libx264"
+$ffArgs += "-crf";     $ffArgs += "23"
+$ffArgs += "-pix_fmt"; $ffArgs += "yuv420p"
+$ffArgs += "-an"; $ffArgs += "-y"; $ffArgs += $MaskedVideo
+
+& ffmpeg @ffArgs 2>>$LogFile
+
+if (-not (Test-Path $MaskedVideo)) { Log "ERROR: masking failed"; exit 1 }
+Log "  Masking done."
+
+# =============================================================================
+#  STEP 3 — AUDIO
+#  Slice video audio directly using box X positions as timeline markers.
+#  No layering — audio comes straight from the source video.
+#
+#  sliceStart = (boxX / canvasW) * Duration   → where in the video to cut from
+#  sliceDur   = (boxW  / canvasW) * Duration  → how long that slice is
+#  adelay     = sliceStart * 1000ms            → pushes silence before the slice
+#
+#  Gaps between boxes = quiet gap track
+#  Boxes = louder slices, stacked boxes add up additively
+# =============================================================================
+Log ""
+Log "--- STEP 3: Audio ---"
+
+# Extract slices directly from source video audio
+$SlicePaths  = @()
+$SliceDelays = @()
+
+for ($i = 0; $i -lt $Boxes.Count; $i++) {
+    $x          = $Boxes[$i].X
+    $SliceStart = [math]::Round(($x / $CanvasW) * $Duration, 4)
+    $SliceDur   = [math]::Round(($BoxW / $CanvasW) * $Duration, 4)
+    $DelayMs    = [int]($SliceStart * 1000)
+    $SlicePath  = Join-Path $TempFolder "slice$('{0:D2}' -f ($i+1)).wav"
+
+    $FadeIn       = [math]::Min($FadeDuration, $SliceDur / 2)
+    $FadeOut      = [math]::Min($FadeDuration, $SliceDur / 2)
+    $FadeOutStart = [math]::Round($SliceDur - $FadeOut, 4)
+    $FadeFilter   = "afade=t=in:st=0:d=${FadeIn},afade=t=out:st=${FadeOutStart}:d=${FadeOut}"
+
+    Log "  Box $($i+1): x=$x → ${SliceStart}s for ${SliceDur}s (delay ${DelayMs}ms)"
+
+    & ffmpeg -ss $SliceStart -i $LocalFile -t $SliceDur `
+        -vn -af $FadeFilter -c:a pcm_s16le -ac 2 -ar 44100 `
+        -y $SlicePath 2>>$LogFile
+
+    if (Test-Path $SlicePath) {
+        $SlicePaths  += $SlicePath
+        $SliceDelays += $DelayMs
+    } else { Log "    WARNING: slice $($i+1) failed" }
+}
+
+# Gap track: full video audio at low volume
+$GapTrack = Join-Path $TempFolder "gap_track.wav"
+& ffmpeg -i $LocalFile -t $Duration `
+    -vn -af "volume=$GapVolume" -c:a pcm_s16le -ac 2 -ar 44100 `
+    -y $GapTrack 2>>$LogFile
+
+# Apply adelay + volume to each slice
+$ProcessedSlices = @()
+for ($i = 0; $i -lt $SlicePaths.Count; $i++) {
+    $d        = $SliceDelays[$i]
+    $procPath = Join-Path $TempFolder "proc$('{0:D2}' -f ($i+1)).wav"
+    & ffmpeg -i $SlicePaths[$i] `
+        -af "adelay=${d}|${d},volume=$SliceVolume" `
+        -c:a pcm_s16le -ac 2 -ar 44100 -y $procPath 2>>$LogFile
+    if (Test-Path $procPath) { $ProcessedSlices += $procPath }
+}
+$SlicePaths | Remove-Item -Force -ErrorAction SilentlyContinue
+
+# Pairwise sum — true additive stacking
+Log "  Summing $($ProcessedSlices.Count) slices..."
+$SummedSlices = Join-Path $TempFolder "summed_slices.wav"
+if ($ProcessedSlices.Count -eq 1) {
+    Copy-Item $ProcessedSlices[0] $SummedSlices
+} elseif ($ProcessedSlices.Count -gt 1) {
+    $currentSum = Join-Path $TempFolder "sum_step0.wav"
+    & ffmpeg -i $ProcessedSlices[0] -i $ProcessedSlices[1] `
+        -filter_complex "[0][1]amix=inputs=2:duration=longest:normalize=0[aout]" `
+        -map "[aout]" -c:a pcm_s16le -ac 2 -ar 44100 -y $currentSum 2>>$LogFile
+
+    for ($i = 2; $i -lt $ProcessedSlices.Count; $i++) {
+        $nextSum = Join-Path $TempFolder "sum_step$i.wav"
+        & ffmpeg -i $currentSum -i $ProcessedSlices[$i] `
+            -filter_complex "[0][1]amix=inputs=2:duration=longest:normalize=0[aout]" `
+            -map "[aout]" -c:a pcm_s16le -ac 2 -ar 44100 -y $nextSum 2>>$LogFile
+        Remove-Item $currentSum -Force -ErrorAction SilentlyContinue
+        $currentSum = $nextSum
+    }
+    Move-Item $currentSum $SummedSlices -Force
+}
+$ProcessedSlices | Remove-Item -Force -ErrorAction SilentlyContinue
+
+# Mix summed slices with quiet gap track
+$AudioWav    = Join-Path $OutputFolder "${Title}_${Timestamp}_audio.wav"
+$ffArgs      = @("-i"; $GapTrack; "-i"; $SummedSlices)
+$audioFilter = "[0][1]amix=inputs=2:duration=longest:normalize=0[aout]"
+$ffArgs += "-filter_complex"; $ffArgs += $audioFilter
+$ffArgs += "-map"; $ffArgs += "[aout]"
+$ffArgs += "-c:a"; $ffArgs += "pcm_s16le"
+$ffArgs += "-ac";  $ffArgs += "2"
+$ffArgs += "-ar";  $ffArgs += "44100"
+$ffArgs += "-y";   $ffArgs += $AudioWav
+& ffmpeg @ffArgs 2>>$LogFile
+Remove-Item $GapTrack -Force -ErrorAction SilentlyContinue
+Remove-Item $SummedSlices -Force -ErrorAction SilentlyContinue
+
+if (-not (Test-Path $AudioWav)) { Log "ERROR: audio mix failed"; exit 1 }
+Log "  WAV saved."
+
+# =============================================================================
+#  STEP 4 — COMBINE INTO FINAL MP4
+# =============================================================================
+Log ""
+Log "--- STEP 4: Final combine ---"
+$FinalMp4 = Join-Path $OutputFolder "${Title}_${Timestamp}.mp4"
+
+& ffmpeg -i $MaskedVideo -i $AudioWav `
+    -c:v copy -c:a aac -b:a 192k -ac 2 -shortest -y $FinalMp4 2>>$LogFile
+
+Remove-Item $MaskedVideo -Force -ErrorAction SilentlyContinue
+Remove-Item $TempFolder -Recurse -Force -ErrorAction SilentlyContinue
+
+# =============================================================================
+#  SUMMARY
+# =============================================================================
+Log ""
+if (Test-Path $FinalMp4) {
+    Log "Done!"
+    Log "  Source : $InputFile"
+    Log "  Canvas : ${CanvasW} x ${CanvasH} px"
+    Log "  MP4    : $FinalMp4"
+    Log "  WAV    : $AudioWav"
+    Write-Host "`nMP4 : $FinalMp4" -ForegroundColor Cyan
+    Write-Host "WAV : $AudioWav"   -ForegroundColor Cyan
+} else {
+    Log "ERROR: final MP4 not created."
+    Write-Host "Failed — check log: $LogFile" -ForegroundColor Red
+}
